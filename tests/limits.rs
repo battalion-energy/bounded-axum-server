@@ -219,27 +219,47 @@ async fn excess_concurrent_requests_return_503_immediately() {
 
 #[tokio::test]
 async fn connection_cap_bounds_accepted_sockets_and_unblocks_when_slot_frees() {
+    let entered = Arc::new(Barrier::new(3)); // 2 handlers + test task
+    let release = Arc::new(Notify::new());
+
+    let router = hello_router().route(
+        "/block",
+        get({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || async move {
+                entered.wait().await;
+                release.notified().await;
+                StatusCode::OK
+            }
+        }),
+    );
+
+    // Zero shed headroom: `max_connections == 2`, so a 3rd client cannot even be accepted
+    // (nor handed a 503) while both connection slots are occupied.
     let limits = fast_limits(
-        1, // max_concurrent_requests
-        1, // shed_connection_headroom -> 2 max open connections
+        2, // max_concurrent_requests
+        0, // shed_connection_headroom -> 2 max open connections
         1024,
         Duration::from_secs(5),
         Duration::from_secs(5),
         Duration::from_secs(2),
     );
-    let server = TestServer::start(hello_router(), limits).await;
+    let server = TestServer::start(router, limits).await;
 
-    // Occupy both connection slots with clients that send partial headers so we know the server
-    // has accepted both sockets (their bytes are accepted into Hyper's parser).
-    let mut stalled_1 = TcpStream::connect(server.addr()).await.unwrap();
-    stalled_1.write_all(b"GET /he").await.unwrap();
-    let mut stalled_2 = TcpStream::connect(server.addr()).await.unwrap();
-    stalled_2.write_all(b"GET /he").await.unwrap();
+    let req1 = tokio::spawn({
+        let addr = server.addr();
+        async move { raw_request(addr, b"GET /block HTTP/1.1\r\nHost: localhost\r\n\r\n").await }
+    });
+    let req2 = tokio::spawn({
+        let addr = server.addr();
+        async move { raw_request(addr, b"GET /block HTTP/1.1\r\nHost: localhost\r\n\r\n").await }
+    });
 
-    // Give the accept loop a brief moment to accept both stalled connections.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Deterministically prove both connections are accepted and occupying both permits.
+    entered.wait().await;
 
-    // A 3rd client must wait because all `max_connections` (2) permits are held.
+    // A 3rd client must wait because `accept()` is paused at `max_connections` (2).
     let mut third = TcpStream::connect(server.addr()).await.unwrap();
     third
         .write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -248,14 +268,14 @@ async fn connection_cap_bounds_accepted_sockets_and_unblocks_when_slot_frees() {
 
     let mut buf = Vec::new();
     let blocked =
-        tokio::time::timeout(Duration::from_millis(150), third.read_to_end(&mut buf)).await;
+        tokio::time::timeout(Duration::from_millis(120), third.read_to_end(&mut buf)).await;
     assert!(
         blocked.is_err(),
         "3rd connection should wait while all connection slots are occupied"
     );
 
-    // Dropping one stalled connection frees a permit; the 3rd client is now served 200 OK.
-    drop(stalled_1);
+    // Releasing one in-flight request closes its connection and frees a permit; client #3 gets 200.
+    release.notify_one();
     tokio::time::timeout(Duration::from_secs(2), third.read_to_end(&mut buf))
         .await
         .expect("3rd client should be served once a slot frees")
@@ -263,7 +283,10 @@ async fn connection_cap_bounds_accepted_sockets_and_unblocks_when_slot_frees() {
     let (status, _, _) = parse_http_response(&buf);
     assert_eq!(status, 200);
 
-    drop(stalled_2);
+    release.notify_waiters();
+    assert_eq!(req1.await.unwrap().0, 200);
+    assert_eq!(req2.await.unwrap().0, 200);
+
     server.shutdown().await;
 }
 

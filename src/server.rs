@@ -6,7 +6,6 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Body;
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{Request, StatusCode};
@@ -23,7 +22,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tower::limit::ConcurrencyLimitLayer;
 use tower::load_shed::LoadShedLayer;
-use tower::{ServiceBuilder, ServiceExt};
+use tower::ServiceBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
@@ -69,8 +68,12 @@ pub struct ServerLimits {
     /// Hard cap on Hyper's HTTP/1.1 read buffer for request headers (`>= 8 KiB`).
     max_header_buf_bytes: usize,
     /// Maximum time after connect for the client to finish sending HTTP headers.
+    /// Enforced by Hyper before Tower middleware runs (so a timeout closes the socket or sends a
+    /// bare `408`, not a JSON error body).
     header_read_timeout: Duration,
-    /// Maximum time for reading the request body and executing the handler (`408 Request Timeout`).
+    /// Maximum time for reading the request body and producing the HTTP response (`408`).
+    /// Covers buffered replies end-to-end; does not bound draining a streaming response body to a
+    /// slow reader after headers are sent.
     request_timeout: Duration,
     /// Maximum time graceful shutdown waits for in-flight connections to finish.
     shutdown_drain_timeout: Duration,
@@ -205,6 +208,7 @@ pub async fn serve(
             () = &mut shutdown => break,
             permit = Arc::clone(&connection_slots).acquire_owned() => match permit {
                 Ok(permit) => permit,
+                // Defensive: `connection_slots` is never closed, so this is unreachable.
                 Err(_) => break,
             },
         };
@@ -224,17 +228,15 @@ pub async fn serve(
         // Explicit HTTP/1.1-only connection with `keep_alive(false)`:
         // - Immune to Cargo feature unification enabling `axum/http2` elsewhere.
         // - Eliminates idle keep-alive slot squatting.
-        // - Bounds worst-case connection lifetime to `header_read_timeout + request_timeout`.
+        // - Bounds worst-case connection lifetime to `header_read_timeout + request_timeout`
+        //   for buffered responses.
         let mut http = http1::Builder::new();
         http.timer(TokioTimer::new())
             .header_read_timeout(limits.header_read_timeout())
             .keep_alive(false)
             .max_buf_size(limits.max_header_buf_bytes());
 
-        let service = TowerToHyperService::new(
-            app.clone()
-                .map_request(|req: Request<Incoming>| req.map(Body::new)),
-        );
+        let service = TowerToHyperService::new(app.clone());
         let conn = graceful.watch(http.serve_connection(TokioIo::new(stream), service));
 
         tokio::spawn(async move {
@@ -263,11 +265,15 @@ pub async fn serve(
 /// outside rather than via `Router::layer`, avoiding `Router::layer`'s `Sync` bound and needing
 /// no `BufferLayer` background task. Every clone of the returned service shares the same
 /// underlying `Arc<Semaphore>`.
+///
+/// Because `axum::Router<()>` implements `Service<Request<B>>` for any `HttpBody<Data = Bytes>`
+/// (including Hyper's `Incoming`) and converts it to `axum::body::Body` internally, Hyper plugs
+/// straight into the returned service through `TowerToHyperService` without a `map_request` layer.
 fn apply_request_limits(
     router: Router,
     limits: ServerLimits,
 ) -> impl tower::Service<
-    Request<Body>,
+    Request<Incoming>,
     Response = Response,
     Error = std::convert::Infallible,
     Future = impl Future<Output = Result<Response, std::convert::Infallible>> + Send,
@@ -288,7 +294,7 @@ fn apply_request_limits(
 
     ServiceBuilder::new()
         // Outermost: convert LoadShed's `Overloaded` error into `503 Service Unavailable`.
-        .layer(HandleErrorLayer::<_, ()>::new(handle_middleware_error))
+        .layer(HandleErrorLayer::new(handle_middleware_error))
         // Immediately shed excess requests instead of queueing them in memory.
         .layer(LoadShedLayer::new())
         // Hard cap on concurrent in-flight requests (shared Arc<Semaphore> across clones).

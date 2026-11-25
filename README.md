@@ -26,11 +26,16 @@ Worst-case memory across clients is bounded by:
 max_connections × max_header_buf_bytes  +  max_concurrent_requests × max_body_bytes
 ```
 
-Worst-case lifetime of any single connection is bounded by:
+Worst-case lifetime of any single connection (for buffered responses) is bounded by:
 
 ```text
 header_read_timeout + request_timeout
 ```
+
+### Caveats
+
+- **Pre-header vs. post-header `408` format**: `header_read_timeout` fires inside Hyper before Tower middleware runs, so it closes the socket or writes a bare HTTP `408` rather than a JSON error body.
+- **Streaming responses**: `tower_http::timeout::TimeoutLayer` bounds reading the request body and producing the `Response`, not draining a streaming response body to a slow reader after headers are sent. For buffered JSON responses that is exact; if streaming/SSE routes are added later, add a write/idle deadline on the stream or socket.
 
 ## Proving Every Limit
 
