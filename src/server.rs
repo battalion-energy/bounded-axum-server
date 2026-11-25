@@ -1,4 +1,4 @@
-//! Bounded HTTP/1.1 Unix-socket server using Axum for routing/middleware and Hyper's HTTP/1.1
+//! Bounded HTTP/1.1 web server using Axum for routing/middleware and Hyper's HTTP/1.1
 //! connection builder as the escape hatch for connection-level limits.
 
 use std::future::Future;
@@ -19,7 +19,7 @@ use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use serde::Serialize;
 use thiserror::Error;
-use tokio::net::UnixListener;
+use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tower::limit::ConcurrencyLimitLayer;
 use tower::load_shed::LoadShedLayer;
@@ -177,7 +177,7 @@ impl Default for ServerLimits {
     }
 }
 
-/// Serve an Axum [`Router`] over a Unix socket with all [`ServerLimits`] enforced.
+/// Serve an Axum [`Router`] over TCP with all [`ServerLimits`] enforced.
 ///
 /// The high-level Axum router is wrapped with Tower / Tower-HTTP middleware for request-level
 /// controls (`503` load shedding, `408` request timeouts, `413` body limits), and served through
@@ -185,7 +185,7 @@ impl Default for ServerLimits {
 /// `keep_alive(false)`, `max_buf_size`, explicit HTTP/1.1-only, and bounded graceful shutdown)
 /// are enforced.
 pub async fn serve(
-    listener: UnixListener,
+    listener: TcpListener,
     router: Router,
     limits: ServerLimits,
     shutdown: impl Future<Output = ()>,
@@ -215,7 +215,7 @@ pub async fn serve(
             accepted = listener.accept() => match accepted {
                 Ok((stream, _addr)) => stream,
                 Err(err) => {
-                    tracing::warn!(%err, "failed to accept Unix socket connection");
+                    tracing::warn!(%err, "failed to accept TCP connection");
                     continue;
                 }
             },

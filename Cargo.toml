@@ -3,7 +3,7 @@ name = "bounded-axum-server"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Reference Axum + Hyper HTTP/1.1 + Tower server demonstrating provable resource limits over a Unix socket"
+description = "Reference Axum + Hyper HTTP/1.1 + Tower web server demonstrating provable resource limits"
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -23,4 +23,3 @@ tracing-subscriber = "0.3"
 
 [dev-dependencies]
 serde_json = "1"
-tempfile = "3"

@@ -1,7 +1,7 @@
 //! Integration tests that deterministically prove every limit enforced by `bounded_axum_server`.
 
+use std::net::SocketAddr;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,24 +11,23 @@ use axum::routing::{get, post};
 use axum::Router;
 use bounded_axum_server::hello_router;
 use bounded_axum_server::server::{self, LimitsError, ServerLimits, MIN_HEADER_BUF_BYTES};
-use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Barrier, Notify};
 use tokio::task::JoinHandle;
 
 struct TestServer {
-    _dir: TempDir,
-    socket_path: PathBuf,
+    addr: SocketAddr,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
 
 impl TestServer {
     async fn start(router: Router, limits: ServerLimits) -> Self {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let socket_path = dir.path().join("test.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind unix socket");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback TCP listener");
+        let addr = listener.local_addr().expect("local addr");
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         let task = tokio::spawn(async move {
@@ -39,15 +38,14 @@ impl TestServer {
         });
 
         Self {
-            _dir: dir,
-            socket_path,
+            addr,
             shutdown_tx: Some(shutdown_tx),
             task,
         }
     }
 
-    fn path(&self) -> &Path {
-        &self.socket_path
+    fn addr(&self) -> SocketAddr {
+        self.addr
     }
 
     fn trigger_shutdown(&mut self) {
@@ -85,9 +83,9 @@ fn fast_limits(
     .expect("valid test limits")
 }
 
-/// Send raw HTTP/1.1 bytes over a Unix socket and read until EOF, returning `(status_code, raw_headers, body)`.
-async fn raw_request(path: &Path, request: &[u8]) -> (u16, String, String) {
-    let mut stream = UnixStream::connect(path).await.expect("connect");
+/// Send raw HTTP/1.1 bytes over TCP and read until EOF, returning `(status_code, raw_headers, body)`.
+async fn raw_request(addr: SocketAddr, request: &[u8]) -> (u16, String, String) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
     stream.write_all(request).await.expect("write request");
     let mut response = Vec::new();
     stream
@@ -116,7 +114,7 @@ fn parse_http_response(raw: &[u8]) -> (u16, String, String) {
 async fn hello_and_echo_succeed_and_disable_keep_alive() {
     let server = TestServer::start(hello_router(), ServerLimits::default()).await;
 
-    let mut stream = UnixStream::connect(server.path()).await.unwrap();
+    let mut stream = TcpStream::connect(server.addr()).await.unwrap();
     stream
         .write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await
@@ -139,7 +137,7 @@ async fn hello_and_echo_succeed_and_disable_keep_alive() {
 
     // POST /echo returns the exact payload.
     let (status, _, body) = raw_request(
-        server.path(),
+        server.addr(),
         b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nping!",
     )
     .await;
@@ -178,12 +176,12 @@ async fn excess_concurrent_requests_return_503_immediately() {
     let server = TestServer::start(router, limits).await;
 
     let req1 = tokio::spawn({
-        let path = server.path().to_owned();
-        async move { raw_request(&path, b"GET /block HTTP/1.1\r\nHost: localhost\r\n\r\n").await }
+        let addr = server.addr();
+        async move { raw_request(addr, b"GET /block HTTP/1.1\r\nHost: localhost\r\n\r\n").await }
     });
     let req2 = tokio::spawn({
-        let path = server.path().to_owned();
-        async move { raw_request(&path, b"GET /block HTTP/1.1\r\nHost: localhost\r\n\r\n").await }
+        let addr = server.addr();
+        async move { raw_request(addr, b"GET /block HTTP/1.1\r\nHost: localhost\r\n\r\n").await }
     });
 
     // Wait until both concurrency slots are definitely occupied inside `/block`.
@@ -193,7 +191,7 @@ async fn excess_concurrent_requests_return_503_immediately() {
     let (status, _, body) = tokio::time::timeout(
         Duration::from_secs(1),
         raw_request(
-            server.path(),
+            server.addr(),
             b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n",
         ),
     )
@@ -210,7 +208,7 @@ async fn excess_concurrent_requests_return_503_immediately() {
 
     // Subsequent request succeeds again.
     let (status, _, _) = raw_request(
-        server.path(),
+        server.addr(),
         b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n",
     )
     .await;
@@ -233,16 +231,16 @@ async fn connection_cap_bounds_accepted_sockets_and_unblocks_when_slot_frees() {
 
     // Occupy both connection slots with clients that send partial headers so we know the server
     // has accepted both sockets (their bytes are accepted into Hyper's parser).
-    let mut stalled_1 = UnixStream::connect(server.path()).await.unwrap();
+    let mut stalled_1 = TcpStream::connect(server.addr()).await.unwrap();
     stalled_1.write_all(b"GET /he").await.unwrap();
-    let mut stalled_2 = UnixStream::connect(server.path()).await.unwrap();
+    let mut stalled_2 = TcpStream::connect(server.addr()).await.unwrap();
     stalled_2.write_all(b"GET /he").await.unwrap();
 
     // Give the accept loop a brief moment to accept both stalled connections.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // A 3rd client must wait because all `max_connections` (2) permits are held.
-    let mut third = UnixStream::connect(server.path()).await.unwrap();
+    let mut third = TcpStream::connect(server.addr()).await.unwrap();
     third
         .write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await
@@ -283,7 +281,7 @@ async fn stalled_client_sending_zero_bytes_is_dropped_by_header_timeout() {
     let server = TestServer::start(hello_router(), limits).await;
 
     // Connect and send NOTHING at all.
-    let mut silent = UnixStream::connect(server.path()).await.unwrap();
+    let mut silent = TcpStream::connect(server.addr()).await.unwrap();
     let start = Instant::now();
     let mut buf = [0u8; 64];
     let n = tokio::time::timeout(Duration::from_secs(2), silent.read(&mut buf))
@@ -299,7 +297,7 @@ async fn stalled_client_sending_zero_bytes_is_dropped_by_header_timeout() {
 
     // Because the silent client was dropped, the single connection slot is free again.
     let (status, _, _) = raw_request(
-        server.path(),
+        server.addr(),
         b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n",
     )
     .await;
@@ -321,7 +319,7 @@ async fn partial_headers_slowloris_is_dropped_by_header_timeout() {
     let server = TestServer::start(hello_router(), limits).await;
 
     // Send incomplete headers (no terminating CRLFCRLF) and stall.
-    let mut slow = UnixStream::connect(server.path()).await.unwrap();
+    let mut slow = TcpStream::connect(server.addr()).await.unwrap();
     slow.write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\n")
         .await
         .unwrap();
@@ -339,7 +337,7 @@ async fn partial_headers_slowloris_is_dropped_by_header_timeout() {
     }
 
     let (status, _, _) = raw_request(
-        server.path(),
+        server.addr(),
         b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n",
     )
     .await;
@@ -371,7 +369,7 @@ async fn slow_handler_returns_408_and_frees_concurrency_slot() {
     let (status, _, _) = tokio::time::timeout(
         Duration::from_secs(2),
         raw_request(
-            server.path(),
+            server.addr(),
             b"GET /hang HTTP/1.1\r\nHost: localhost\r\n\r\n",
         ),
     )
@@ -381,7 +379,7 @@ async fn slow_handler_returns_408_and_frees_concurrency_slot() {
 
     // Concurrency slot must be free immediately after the 408.
     let (status, _, _) = raw_request(
-        server.path(),
+        server.addr(),
         b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n",
     )
     .await;
@@ -403,7 +401,7 @@ async fn slow_body_returns_408_and_closes_connection() {
     let server = TestServer::start(hello_router(), limits).await;
 
     // Declare Content-Length: 16, send only 2 bytes, then stall.
-    let mut stream = UnixStream::connect(server.path()).await.unwrap();
+    let mut stream = TcpStream::connect(server.addr()).await.unwrap();
     stream
         .write_all(b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 16\r\n\r\nhi")
         .await
@@ -419,7 +417,7 @@ async fn slow_body_returns_408_and_closes_connection() {
 
     // Single slot is freed and healthy client succeeds.
     let (status, _, _) = raw_request(
-        server.path(),
+        server.addr(),
         b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n",
     )
     .await;
@@ -456,13 +454,13 @@ async fn request_body_limit_enforced_for_content_length_chunked_and_raw_body() {
     let ok_body = "a".repeat(64);
     let req =
         format!("POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\n{ok_body}");
-    let (status, _, body) = raw_request(server.path(), req.as_bytes()).await;
+    let (status, _, body) = raw_request(server.addr(), req.as_bytes()).await;
     assert_eq!(status, 200);
     assert_eq!(body.len(), 64);
 
     // 2. Over limit via Content-Length (65 bytes) is rejected upfront with 413 even before body bytes arrive.
     let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 65\r\n\r\n";
-    let (status, _, _) = raw_request(server.path(), req.as_bytes()).await;
+    let (status, _, _) = raw_request(server.addr(), req.as_bytes()).await;
     assert_eq!(status, 413);
 
     // 3. Over limit via chunked transfer encoding (no Content-Length) is rejected with 413.
@@ -470,14 +468,14 @@ async fn request_body_limit_enforced_for_content_length_chunked_and_raw_body() {
     let req = format!(
         "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n41\r\n{chunk}\r\n0\r\n\r\n"
     );
-    let (status, _, _) = raw_request(server.path(), req.as_bytes()).await;
+    let (status, _, _) = raw_request(server.addr(), req.as_bytes()).await;
     assert_eq!(status, 413);
 
     // 4. Raw `axum::body::Body` route is also rejected with 413 by RequestBodyLimitLayer.
     let req = format!(
         "POST /raw HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n41\r\n{chunk}\r\n0\r\n\r\n"
     );
-    let (status, _, _) = raw_request(server.path(), req.as_bytes()).await;
+    let (status, _, _) = raw_request(server.addr(), req.as_bytes()).await;
     assert_eq!(status, 413);
 
     server.shutdown().await;
@@ -499,7 +497,7 @@ async fn oversized_headers_rejected_by_max_buf_size() {
     let huge_header = "x".repeat(MIN_HEADER_BUF_BYTES + 1024);
     let req = format!("GET /hello HTTP/1.1\r\nHost: localhost\r\nX-Pad: {huge_header}\r\n\r\n");
 
-    let mut stream = UnixStream::connect(server.path()).await.unwrap();
+    let mut stream = TcpStream::connect(server.addr()).await.unwrap();
     let _ = stream.write_all(req.as_bytes()).await;
     let mut reply = Vec::new();
     let _ = stream.read_to_end(&mut reply).await;
@@ -543,8 +541,8 @@ async fn graceful_shutdown_drains_in_flight_request_before_exiting() {
     let mut server = TestServer::start(router, limits).await;
 
     let req = tokio::spawn({
-        let path = server.path().to_owned();
-        async move { raw_request(&path, b"GET /block HTTP/1.1\r\nHost: localhost\r\n\r\n").await }
+        let addr = server.addr();
+        async move { raw_request(addr, b"GET /block HTTP/1.1\r\nHost: localhost\r\n\r\n").await }
     });
 
     entered.wait().await;
@@ -592,9 +590,9 @@ async fn graceful_shutdown_respects_drain_timeout_for_wedged_request() {
     let mut server = TestServer::start(router, limits).await;
 
     let _client = tokio::spawn({
-        let path = server.path().to_owned();
+        let addr = server.addr();
         async move {
-            let mut s = UnixStream::connect(&path).await.unwrap();
+            let mut s = TcpStream::connect(addr).await.unwrap();
             let _ = s
                 .write_all(b"GET /hang HTTP/1.1\r\nHost: localhost\r\n\r\n")
                 .await;

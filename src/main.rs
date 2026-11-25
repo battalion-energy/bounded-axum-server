@@ -1,26 +1,23 @@
-//! Runs the hello-world bounded Axum server on a Unix socket path (default: `/tmp/bounded-axum.sock`).
+//! Runs the hello-world bounded Axum web server (default: `127.0.0.1:3000`).
 
-use std::path::PathBuf;
+use std::net::SocketAddr;
 
 use bounded_axum_server::hello_router;
 use bounded_axum_server::server::{self, ServerLimits};
-use tokio::net::UnixListener;
+use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let socket_path = std::env::args()
+    let addr: SocketAddr = std::env::args()
         .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/bounded-axum.sock"));
+        .unwrap_or_else(|| "127.0.0.1:3000".to_owned())
+        .parse()?;
 
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)?;
-    }
-
-    let listener = UnixListener::bind(&socket_path)?;
-    tracing::info!(socket = %socket_path.display(), "listening");
+    let listener = TcpListener::bind(addr).await?;
+    let local_addr = listener.local_addr()?;
+    tracing::info!(%local_addr, "listening");
 
     server::serve(listener, hello_router(), ServerLimits::default(), async {
         let _ = tokio::signal::ctrl_c().await;
@@ -28,6 +25,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await;
 
-    let _ = std::fs::remove_file(&socket_path);
     Ok(())
 }

@@ -1,4 +1,4 @@
-//! Reference bounded HTTP/1.1 server built with Axum, Hyper, and Tower over a Unix domain socket.
+//! Reference bounded HTTP/1.1 web server built with Axum, Hyper, and Tower.
 //!
 //! Demonstrates how to keep the high-level Axum routing/extractor API everywhere except the
 //! single [`server::serve`] accept loop, while enforcing provable ceilings on:

@@ -1,6 +1,8 @@
 # bounded-axum-server
 
-A minimal, runnable reference showing how to keep the high-level **Axum** API (`Router`, extractors, `IntoResponse`, Tower middleware) everywhere except a single ~40-line **Hyper HTTP/1.1** accept loop, while enforcing provable ceilings on file descriptors, concurrency, request memory, and stalled clients over a Unix domain socket.
+A minimal, runnable reference showing how to keep the high-level **Axum** API (`Router`, extractors, `IntoResponse`, Tower middleware) everywhere except a single ~40-line **Hyper HTTP/1.1** accept loop, while enforcing provable ceilings on file descriptors, concurrency, request memory, and stalled clients.
+
+*(Uses `tokio::net::TcpListener`; swapping to `UnixListener` is a one-line change since `TokioIo::new(stream)` works on any `AsyncRead + AsyncWrite`.)*
 
 ## Architecture
 
@@ -56,7 +58,7 @@ cargo test
 ## Running Manually
 
 ```sh
-cargo run -- /tmp/bounded-axum.sock
+cargo run -- 127.0.0.1:3000
 # In another terminal:
-curl --unix-socket /tmp/bounded-axum.sock http://localhost/hello
+curl http://127.0.0.1:3000/hello
 ```
